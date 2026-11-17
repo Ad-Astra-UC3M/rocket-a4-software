@@ -1,0 +1,426 @@
+/**
+ * @file main.c
+ * @brief Esqueleto de Firmware ID-FCC / UKB con Máquina de Estados Oficial TEKNOFEST (SFT/Vuelo)
+ * Arquitectura:
+ *  1. Un módulo por cada pieza física (Drivers HAL aislados).
+ *  2. Recorrido lineal: Sensor -> Cálculo -> Decisión (FSM 6 Estados) -> Disparo, Registro y Radio.
+ *  3. Ejecución 100% no bloqueante (ISR + RingBuffer + Timers).
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+
+/* ============================================================================
+ * 1. DEFINICIONES DE PROTOCOLO Y MÁQUINA DE ESTADOS
+ * ============================================================================ */
+
+// Tramas RS232 (Anexo 7 - Tablas 1, 3, 4 y 6)
+#define HEADER_CMD_STATUS       0xAA
+#define HEADER_TELEMETRY        0xAB
+#define FOOTER_1                0x0D
+#define FOOTER_2                0x0A
+
+#define CMD_START_SMT           0x20
+#define CMD_START_SFT           0x22
+#define CMD_STOP                0x24
+
+// Temporizaciones (ms)
+#define ACTIVATION_DELAY_MS     1000U   // Retardo de 1s tras comando Start
+#define SFT_TIMEOUT_MS          1000U   // Watchdog de comunicación SFT
+#define TX_PERIOD_MS            100U    // Frecuencia fija de 10 Hz
+#define BURNOUT_PRECAUTION_MS   1500U   // Tiempo de seguridad post-apagado de motor
+
+// Umbrales físicos de vuelo (Diagrama manuscrito + Documento FSM)
+#define LAUNCH_ACCEL_THRESHOLD  20.0f   // m/s^2 (Detección de impulso longitudinal)
+#define MIN_ALTITUDE_THRESHOLD  150.0f  // m (Altitud mínima normativa - Bit 2)
+#define MAX_TILT_ANGLE_DEG      45.0f   // deg (Límite de inclinación - Bit 3)
+#define MAX_HORIZ_ACCEL         15.0f   // m/s^2 (Límite aceleración horizontal - Bit 3)
+#define MAIN_CHUTE_ALT_HIGH     600.0f  // m (Cota superior apertura principal)
+#define MAIN_CHUTE_ALT_LOW      400.0f  // m (Cota inferior apertura principal)
+
+// Modos de operación del sistema
+typedef enum {
+    SYS_MODE_NORMAL = 0,
+    SYS_MODE_SMT_PENDING,
+    SYS_MODE_SMT_ACTIVE,
+    SYS_MODE_SFT_PENDING,
+    SYS_MODE_SFT_ACTIVE
+} SystemMode_t;
+
+// Los 6 Estados de Vuelo definidos en la especificación
+typedef enum {
+    STATE_1_STANDBY_IDLE = 0,   // Inicio en Rampa (Data 1 = 0x00)
+    STATE_2_LAUNCH_POWERED,     // Despegue / Ascenso en Potencia (Data 1 = 0x01)
+    STATE_3_COASTING_UNPOWERED, // Vuelo Libre / Ascenso sin Potencia (Data 1 = 0x07)
+    STATE_4_APOGEE_DROGUE,      // Apogeo y Paracaídas de Deriva / Drift (Data 1 = 0x37)
+    STATE_5_MAIN_DESCENT,       // Descenso Controlado y Paracaídas Principal (Data 1 = 0xF7)
+    STATE_6_LANDED              // Aterrizaje / Cohete en Tierra (Data 1 = 0xFF)
+} FlightState_t;
+
+// Unión para conversión Byte Array <-> FLOAT32 (Sección 4.2 y 4.3 Anexo 7)
+typedef union {
+    float   f32;
+    uint8_t bytes[4];
+} Float32Converter_t;
+
+// Datos de sensores en ejes del cuerpo (+X nariz, +Y derecha, +Z suelo)
+typedef struct {
+    float altitude;     // y: Posición vertical / altitud (m)
+    float prev_altitude;// Altitud anterior para gradiente y velocidad vertical
+    float vertical_vel; // Vy: Velocidad vertical calculada (m/s)
+    float pressure;     // Presión barométrica (mBar)
+    float accel_x;      // Aceleración longitudinal (eje del motor)
+    float accel_y;      // Aceleración lateral
+    float accel_z;      // Aceleración vertical cuerpo
+    float angle_x;      // Roll (deg)
+    float angle_y;      // Pitch (deg)
+    float angle_z;      // Yaw (deg)
+} FlightData_t;
+
+// Registro de Estado de 8 bits (Data 1 - Table 5 Anexo 7; Data 2 siempre es 0x00)
+typedef union {
+    uint8_t byte;
+    struct {
+        uint8_t bit0_launch_detected    : 1; // 0x01: Lanzamiento detectado
+        uint8_t bit1_burnout_expired    : 1; // 0x02: Tiempo precaución burnout expirado
+        uint8_t bit2_min_alt_exceeded   : 1; // 0x04: Altitud mínima superada
+        uint8_t bit3_angle_accel_alert  : 1; // 0x08: Alerta de ángulo/acel horizontal (o transición ascenso sin potencia)
+        uint8_t bit4_apogee_descent     : 1; // 0x10: Altitud comienza a disminuir (Apogeo)
+        uint8_t bit5_drogue_deployed    : 1; // 0x20: Orden paracaídas deriva (Pyro 1)
+        uint8_t bit6_main_alt_crossed   : 1; // 0x40: Altitud por debajo de cota principal
+        uint8_t bit7_main_deployed      : 1; // 0x80: Orden paracaídas principal (Pyro 2)
+    } bits;
+} StatusData1_t;
+
+/* ============================================================================
+ * 2. DRIVERS DE PIEZAS FÍSICAS (HAL - UN MÓDULO POR PIEZA)
+ * ============================================================================ */
+
+extern uint32_t HAL_GetTickMs(void);
+
+// --- Driver Barómetro ---
+void Baro_Init(void) { /* Inicializar bus I2C/SPI */ }
+bool Baro_ReadNonBlocking(float *alt, float *press) {
+    /* Leer últimos registros sin bloquear */
+    return true;
+}
+
+// --- Driver IMU 6-DOF ---
+void IMU_Init(void) { /* Inicializar acelerómetro y giroscopio */ }
+bool IMU_ReadNonBlocking(FlightData_t *data) {
+    /* Leer aceleraciones y ángulos en ejes fijos al cuerpo */
+    return true;
+}
+
+// --- Driver UART / RS232 (115200 bps, 8N1, Full-Duplex + MAX3232) ---
+#define RX_BUF_SIZE 256
+static volatile uint8_t  rx_ring_buf[RX_BUF_SIZE];
+static volatile uint16_t rx_head = 0, rx_tail = 0;
+
+void UART_RS232_Init(void) { /* Configurar UART 115200 8N1 con interrupción RX */ }
+
+void UART_RX_IRQHandler(uint8_t byte) {
+    uint16_t next = (rx_head + 1U) % RX_BUF_SIZE;
+    if (next != rx_tail) {
+        rx_ring_buf[rx_head] = byte;
+        rx_head = next;
+    }
+}
+
+bool UART_PopByte(uint8_t *byte) {
+    if (rx_head == rx_tail) return false;
+    *byte = rx_ring_buf[rx_tail];
+    rx_tail = (rx_tail + 1U) % RX_BUF_SIZE;
+    return true;
+}
+
+void UART_SendDMA(const uint8_t *buf, uint16_t len) {
+    /* Transmisión asíncrona por DMA/IRQ sin esperar */
+}
+
+// --- Driver Actuadores Pirotécnicos y Payload (0-48VDC / 0-10A máx) ---
+void Pyro_Init(void) { /* Pines en estado seguro LOW */ }
+void Pyro1_Drogue_Fire(bool state)  { /* Salida Pirotécnica 1: Paracaídas Deriva */ }
+void Pyro2_Main_Fire(bool state)    { /* Salida Pirotécnica 2: Paracaídas Principal */ }
+void Payload_Release_Fire(bool state){ /* Separación de carga útil (Payload en Apogeo) */ }
+
+/* ============================================================================
+ * 3. UTILIDADES DE PROTOCOLO (CHECKSUM MOD 256 Y FLOAT32)
+ * ============================================================================ */
+
+uint8_t Calc_Checksum(const uint8_t *data, uint16_t len) {
+    uint32_t sum = 0;
+    for (uint16_t i = 0; i < len; i++) sum += data[i];
+    return (uint8_t)(sum % 256U);
+}
+
+float BytesToFloat32(const uint8_t b[4]) {
+    Float32Converter_t c = { .bytes = { b[0], b[1], b[2], b[3] } };
+    return c.f32;
+}
+
+void Float32ToBytes(float val, uint8_t out[4]) {
+    Float32Converter_t c = { .f32 = val };
+    out[0] = c.bytes[0]; out[1] = c.bytes[1]; out[2] = c.bytes[2]; out[3] = c.bytes[3];
+}
+
+/* ============================================================================
+ * 4. RECORRIDO LINEAL DEL DATO (SENSOR -> CÁLCULO -> DECISIÓN -> SALIDAS)
+ * ============================================================================ */
+
+static SystemMode_t  sys_mode        = SYS_MODE_NORMAL;
+static FlightState_t current_state   = STATE_1_STANDBY_IDLE;
+static StatusData1_t status_d1       = { .byte = 0x00 };
+
+static FlightData_t  raw_data        = {0};
+static FlightData_t  synthetic_data  = {0};
+static FlightData_t  flight_data     = {0};
+
+static bool          motors_armed    = true;  // Señal (Armed) del diagrama
+static uint32_t      mode_timer_ms   = 0;
+static uint32_t      sft_watchdog_ms = 0;
+static uint32_t      burnout_timer_ms= 0;
+static uint32_t      landed_timer_ms = 0;
+static uint32_t      tx_timer_ms     = 0;
+static uint32_t      last_calc_ms    = 0;
+
+// --- PASO 1: Parseo no bloqueante de comandos y datos sintéticos RS232 ---
+void Step_ParseRS232(uint32_t now_ms) {
+    static uint8_t frame[34];
+    static uint8_t idx = 0, expected_len = 0;
+    uint8_t b;
+
+    while (UART_PopByte(&b)) {
+        if (idx == 0) {
+            if (b == HEADER_CMD_STATUS) { expected_len = 5;  frame[idx++] = b; }
+            else if (b == HEADER_TELEMETRY) { expected_len = 34; frame[idx++] = b; }
+        } else {
+            frame[idx++] = b;
+            if (idx == expected_len) {
+                if (frame[expected_len - 2] == FOOTER_1 && frame[expected_len - 1] == FOOTER_2) {
+                    uint8_t chk = Calc_Checksum(frame, expected_len - 3);
+                    if (chk == frame[expected_len - 3]) {
+                        if (expected_len == 5) {
+                            if (frame[1] == CMD_START_SMT) {
+                                sys_mode = SYS_MODE_SMT_PENDING;
+                                mode_timer_ms = now_ms;
+                            } else if (frame[1] == CMD_START_SFT) {
+                                sys_mode = SYS_MODE_SFT_PENDING;
+                                mode_timer_ms = now_ms;
+                            } else if (frame[1] == CMD_STOP) {
+                                sys_mode = SYS_MODE_NORMAL;
+                                current_state = STATE_1_STANDBY_IDLE;
+                                status_d1.byte = 0x00;
+                            }
+                        } else if (expected_len == 34 && sys_mode == SYS_MODE_SFT_ACTIVE) {
+                            synthetic_data.altitude = BytesToFloat32(&frame[1]);
+                            synthetic_data.pressure = BytesToFloat32(&frame[5]);
+                            synthetic_data.accel_x  = BytesToFloat32(&frame[9]);
+                            synthetic_data.accel_y  = BytesToFloat32(&frame[13]);
+                            synthetic_data.accel_z  = BytesToFloat32(&frame[17]);
+                            synthetic_data.angle_x  = BytesToFloat32(&frame[21]);
+                            synthetic_data.angle_y  = BytesToFloat32(&frame[25]);
+                            synthetic_data.angle_z  = BytesToFloat32(&frame[29]);
+                            sft_watchdog_ms = now_ms;
+                        }
+                    }
+                }
+                idx = 0;
+            }
+        }
+    }
+
+    // Temporizadores de activación (1s) y timeout SFT (1000ms)
+    if (sys_mode == SYS_MODE_SMT_PENDING && (now_ms - mode_timer_ms >= ACTIVATION_DELAY_MS)) {
+        sys_mode = SYS_MODE_SMT_ACTIVE;
+    } else if (sys_mode == SYS_MODE_SFT_PENDING && (now_ms - mode_timer_ms >= ACTIVATION_DELAY_MS)) {
+        sys_mode = SYS_MODE_SFT_ACTIVE;
+        current_state = STATE_1_STANDBY_IDLE;
+        status_d1.byte = 0x00;
+        sft_watchdog_ms = now_ms;
+    } else if (sys_mode == SYS_MODE_SFT_ACTIVE && (now_ms - sft_watchdog_ms >= SFT_TIMEOUT_MS)) {
+        sys_mode = SYS_MODE_NORMAL;
+    }
+}
+
+// --- PASO 2: Sensor (MUX entre sensores físicos y datos sintéticos) ---
+void Step_SensorAcquisition(void) {
+    if (sys_mode == SYS_MODE_SFT_ACTIVE) {
+        raw_data = synthetic_data;
+    } else {
+        Baro_ReadNonBlocking(&raw_data.altitude, &raw_data.pressure);
+        IMU_ReadNonBlocking(&raw_data);
+    }
+}
+
+// --- PASO 3: Cálculo (Filtrado de anomalías y cálculo de velocidad vertical Vy) ---
+void Step_Calculation(uint32_t now_ms) {
+    float dt = (now_ms - last_calc_ms) / 1000.0f;
+    if (dt <= 0.0f) return;
+    last_calc_ms = now_ms;
+
+    // Filtrado paso bajo / rechazo de picos anómalos de presión o aceleración
+    flight_data.prev_altitude = flight_data.altitude;
+    flight_data.altitude      = raw_data.altitude; // Aplicar filtro Kalman/EMA aquí
+    flight_data.pressure      = raw_data.pressure;
+    flight_data.accel_x       = raw_data.accel_x;
+    flight_data.accel_y       = raw_data.accel_y;
+    flight_data.accel_z       = raw_data.accel_z;
+    flight_data.angle_x       = raw_data.angle_x;
+    flight_data.angle_y       = raw_data.angle_y;
+    flight_data.angle_z       = raw_data.angle_z;
+
+    // Cálculo de velocidad vertical Vy = dy / dt
+    flight_data.vertical_vel  = (flight_data.altitude - flight_data.prev_altitude) / dt;
+}
+
+// --- PASO 4: Decisión (Máquina de Estados de 6 Etapas y Banderas Data 1) ---
+void Step_FlightDecision(uint32_t now_ms) {
+    if (sys_mode == SYS_MODE_SMT_ACTIVE) return; // En SMT no se ejecuta lógica de disparo
+
+    // Verificación continua de seguridad durante ascenso (Nota de seguridad Bit 3)
+    if (current_state == STATE_2_LAUNCH_POWERED || current_state == STATE_3_COASTING_UNPOWERED) {
+        float horiz_accel = hypotf(flight_data.accel_y, flight_data.accel_z);
+        if (fabsf(flight_data.angle_y) > MAX_TILT_ANGLE_DEG ||
+            fabsf(flight_data.angle_z) > MAX_TILT_ANGLE_DEG ||
+            horiz_accel > MAX_HORIZ_ACCEL) {
+            status_d1.bits.bit3_angle_accel_alert = 1; // Alerta de inclinación/acel horizontal
+        }
+    }
+
+    switch (current_state) {
+        // ESTADO 1: Inicio en Rampa / IDLE (y = 0, Vy = 0 -> Data 1 = 0x00)
+        case STATE_1_STANDBY_IDLE:
+            status_d1.byte = 0x00;
+            // Transición: Señal Armed + motores encendidos (impulso positivo sostenido en eje X)
+            if (motors_armed && flight_data.accel_x > LAUNCH_ACCEL_THRESHOLD) {
+                status_d1.bits.bit0_launch_detected = 1; // Data 1 = 0x01
+                current_state = STATE_2_LAUNCH_POWERED;
+            }
+            break;
+
+        // ESTADO 2: Despegue / Ascenso en Potencia (y > 0, Vy != 0 -> Data 1 = 0x01)
+        case STATE_2_LAUNCH_POWERED:
+            // Transición: Motores apagados (aceleración longitudinal cae por debajo de gravedad/arrastre)
+            if (flight_data.accel_x <= 0.0f && flight_data.altitude > 0.0f) {
+                burnout_timer_ms = now_ms;
+                current_state = STATE_3_COASTING_UNPOWERED;
+            }
+            break;
+
+        // ESTADO 3: Vuelo Libre / Ascenso sin Potencia (Data 1 = 0x07 en vuelo nominal)
+        case STATE_3_COASTING_UNPOWERED:
+            // 1. Expiración del tiempo de precaución tras apagado de motor -> Bit 1
+            if (now_ms - burnout_timer_ms >= BURNOUT_PRECAUTION_MS) {
+                status_d1.bits.bit1_burnout_expired = 1;
+            }
+            // 2. Superación de altitud mínima normativa -> Bit 2 (Data 1 = 0x07)
+            if (flight_data.altitude >= MIN_ALTITUDE_THRESHOLD) {
+                status_d1.bits.bit2_min_alt_exceeded = 1;
+            }
+            // Transición a Apogeo: Velocidad vertical Vy <= 0 (gradiente de altitud negativo)
+            if (flight_data.vertical_vel <= 0.0f && status_d1.bits.bit2_min_alt_exceeded) {
+                status_d1.bits.bit4_apogee_descent   = 1; // Altitud empieza a disminuir
+                status_d1.bits.bit5_drogue_deployed  = 1; // Orden Pyro 1 (Drogue/Drift) -> Data 1 = 0x37
+                current_state = STATE_4_APOGEE_DROGUE;
+            }
+            break;
+
+        // ESTADO 4: Apogeo y Paracaídas de Deriva / Drogue (Data 1 = 0x37)
+        case STATE_4_APOGEE_DROGUE:
+            // En este estado se disparan Pyro 1 (Drogue) y separación de Payload
+            // Transición a Principal: Descenso controlado y altitud cruza cota de seguridad (ej. < 600 m)
+            if (flight_data.vertical_vel < 0.0f && flight_data.altitude <= MAIN_CHUTE_ALT_HIGH) {
+                status_d1.bits.bit6_main_alt_crossed = 1; // Cota principal alcanzada
+                status_d1.bits.bit7_main_deployed    = 1; // Orden Pyro 2 (Main) -> Data 1 = 0xF7
+                current_state = STATE_5_MAIN_DESCENT;
+            }
+            break;
+
+        // ESTADO 5: Descenso Controlado y Paracaídas Principal (Data 1 = 0xF7)
+        case STATE_5_MAIN_DESCENT:
+            // Transición a Aterrizaje: Altitud constante (Vy ~ 0) y aceleración estabilizada en reposo (1G)
+            if (fabsf(flight_data.vertical_vel) < 0.5f && flight_data.altitude < 50.0f) {
+                if (landed_timer_ms == 0) landed_timer_ms = now_ms;
+                if (now_ms - landed_timer_ms >= 2000U) {
+                    status_d1.byte = 0xFF; // Todos los bits (0..7) en 1 -> Misión finalizada
+                    current_state = STATE_6_LANDED;
+                }
+            } else {
+                landed_timer_ms = 0;
+            }
+            break;
+
+        // ESTADO 6: Aterrizaje / Cohete en Tierra (Data 1 = 0xFF)
+        case STATE_6_LANDED:
+            // Estado final alcanzado; mantiene 0xFF hasta recibir comando STOP (0x24)
+            break;
+    }
+}
+
+// --- PASO 5: Salidas Paralelas (Disparo, Registro y Radio TX a 10 Hz) ---
+void Step_Outputs(uint32_t now_ms) {
+    // 1. DISPARO DE ACTUADORES PIROTÉCNICOS Y PAYLOAD
+    Pyro1_Drogue_Fire(status_d1.bits.bit5_drogue_deployed == 1);
+    Payload_Release_Fire(current_state >= STATE_4_APOGEE_DROGUE);
+    Pyro2_Main_Fire(status_d1.bits.bit7_main_deployed == 1);
+
+    // 2. REGISTRO EN MEMORIA (Data 1, Data 2 y telemetría)
+    // FlashLogger_PushNonBlocking(current_state, status_d1.byte, &flight_data);
+
+    // 3. RADIO / TELEMETRÍA RS232 A 10 Hz (Cada 100 ms)
+    if (now_ms - tx_timer_ms >= TX_PERIOD_MS) {
+        tx_timer_ms = now_ms;
+
+        if (sys_mode == SYS_MODE_SFT_ACTIVE) {
+            // Paquete de Estado de 6 bytes (Table 6 Anexo 7)
+            uint8_t status_pkt[6];
+            status_pkt[0] = HEADER_CMD_STATUS; // 0xAA
+            status_pkt[1] = status_d1.byte;    // Data 1: 0x00 -> 0x01 -> 0x07 -> 0x37 -> 0xF7 -> 0xFF
+            status_pkt[2] = 0x00;              // Data 2: Siempre 0x00 (Reserved Table 5)
+            status_pkt[3] = Calc_Checksum(status_pkt, 3);
+            status_pkt[4] = FOOTER_1;          // 0x0D
+            status_pkt[5] = FOOTER_2;          // 0x0A
+            UART_SendDMA(status_pkt, 6);
+
+        } else if (sys_mode == SYS_MODE_SMT_ACTIVE) {
+            // Paquete de Telemetría de Sensores (Table 3 Anexo 7)
+            uint8_t telem_pkt[34];
+            telem_pkt[0] = HEADER_TELEMETRY;   // 0xAB
+            Float32ToBytes(flight_data.altitude, &telem_pkt[1]);
+            Float32ToBytes(flight_data.pressure, &telem_pkt[5]);
+            Float32ToBytes(flight_data.accel_x,  &telem_pkt[9]);
+            Float32ToBytes(flight_data.accel_y,  &telem_pkt[13]);
+            Float32ToBytes(flight_data.accel_z,  &telem_pkt[17]);
+            Float32ToBytes(flight_data.angle_x,  &telem_pkt[21]);
+            Float32ToBytes(flight_data.angle_y,  &telem_pkt[25]);
+            Float32ToBytes(flight_data.angle_z,  &telem_pkt[29]);
+            telem_pkt[31] = Calc_Checksum(telem_pkt, 31);
+            telem_pkt[32] = FOOTER_1;
+            telem_pkt[33] = FOOTER_2;
+            UART_SendDMA(telem_pkt, 34);
+        }
+    }
+}
+
+/* ============================================================================
+ * 5. SUPER-LOOP PRINCIPAL (SIN BLOQUEOS)
+ * ============================================================================ */
+
+int main(void) {
+    Baro_Init();
+    IMU_Init();
+    UART_RS232_Init();
+    Pyro_Init();
+
+    while (1) {
+        uint32_t now = HAL_GetTickMs();
+
+        Step_ParseRS232(now);       // 1. Escuchar comandos/datos sintéticos (ISR RingBuffer)
+        Step_SensorAcquisition();   // 2. Sensor (Físico o Sintético SFT)
+        Step_Calculation(now);      // 3. Cálculo (Filtrado y velocidad vertical Vy)
+        Step_FlightDecision(now);   // 4. Decisión (FSM 6 Estados -> Data 1)
+        Step_Outputs(now);          // 5. Disparo (Pyros/Payload), Registro y Radio (10 Hz)
+    }
+}
