@@ -2,21 +2,38 @@
 #ifndef FLIGHT_SM_H
 #define FLIGHT_SM_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
-// Los 6 Estados de Vuelo normativos
-typedef enum {
-    STATE_1_STANDBY_IDLE = 0,       // 1. Inicio en Rampa (Data 1 = 0x00)
-    STATE_2_LAUNCH_POWERED,         // 2. Despegue / Ascenso en Potencia (Data 1 = 0x01)
-    STATE_3_COASTING_UNPOWERED,     // 3. Vuelo Libre / Ascenso sin Potencia (Data 1 = 0x07)
-    STATE_4_APOGEE_DROGUE,          // 4. Apogeo y Paracaídas de Deriva (Data 1 = 0x37)
-    STATE_5_MAIN_DESCENT,           // 5. Descenso y Paracaídas Principal (Data 1 = 0xF7)
-    STATE_6_LANDED                  // 6. Aterrizaje / Cohete en Tierra (Data 1 = 0xFF)
-} FlightState_t;
+#define LAUNCH_ACCEL_THRESHOLD 20.0f
+#define BURNOUT_PRECAUTION_MS 1500U
+#define MIN_ALTITUDE_THRESHOLD 150.0f
+#define MAIN_CHUTE_ALT_HIGH 600.0f
 
-// Prototipos de funciones
+#define BIT_LAUNCH_DETECTED (1 << 0)
+#define BIT_BURNOUT_EXPIRED (1 << 1)
+#define BIT_MIN_ALT_EXCEEDED (1 << 2)
+#define BIT_ALTITUDE_DECREASING (1 << 4)
+#define BIT_DROGUE_COMMANDED (1 << 5)
+#define BIT_BELOW_MAIN_ALT (1 << 6)
+#define BIT_MAIN_COMMANDED (1 << 7)
+
+typedef enum
+{
+    ESTADO_RAMPA = 0,
+    ESTADO_PROPULSADO,
+    ESTADO_COASTING,
+    ESTADO_APOGEO_DROGUE,
+    ESTADO_DESCENSO_MAIN,
+    ESTADO_ATERRIZADO
+} EstadoVuelo_t;
+
 void FlightSM_Init(void);
-void FlightSM_Update(uint32_t now_ms);
+void FlightSM_Update(uint32_t tiempo_ms, float dt);
 
-#endif
+EstadoVuelo_t FlightSM_GetEstado(void);
+uint16_t FlightSM_GetStatusBits(void);
+bool FlightSM_IsPyro1Active(void);
+bool FlightSM_IsPyro2Active(void);
+
+#endif // FLIGHT_SM_H

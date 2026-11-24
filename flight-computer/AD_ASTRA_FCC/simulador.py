@@ -1,0 +1,1 @@
+with open("vuelo_normal.csv", mode="r", encoding="utf-8") as file:
