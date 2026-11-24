@@ -92,7 +92,7 @@ int main(void)
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
   SENSOR_HUB_Init(); 
-  ESTIMADOR_Init(); 
+  Estimador_Init(0.0f); 
   FlightSM_Init(); 
   TELEMETRIA_Init(); 
   LOGGER_Init();
@@ -102,11 +102,19 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    SENSOR_HUB_Update(); 
-    ESTIMADOR_Update(); 
-    FlightSM_Update(HAL_GetTick()); 
-    LOGGER_Update(); 
-    TELEMETRIA_Update();
+    SENSOR_HUB_Update();
+
+      float altitud_raw = SENSOR_HUB_GetAltitude();
+      float accel_z = SENSOR_HUB_GetAccelZ();
+      float dt = 0.01f;
+
+      Estimador_Update(altitud_raw, accel_z, dt);
+      FlightSM_Update(HAL_GetTick(), dt);
+
+      LOGGER_Update();
+      TELEMETRIA_Update();
+
+      HAL_Delay(10);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
